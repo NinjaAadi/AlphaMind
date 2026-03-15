@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import TorchNormalizer, NaNLabelEncoder
+from pytorch_forecasting.metrics import QuantileLoss
 
 # Configure logging
 logging.basicConfig(
@@ -41,12 +42,104 @@ logger = logging.getLogger(__name__)
 # Configuration
 MODEL_DIR = Path(__file__).parent.parent / "models"
 CHECKPOINT_DIR = Path(__file__).parent.parent / "lightning_logs"
+MODEL_PATH_ENV = os.getenv("MODEL_PATH")  # e.g. /models/tft_stock_model.pt or model_service/models/tft_stock_model.pt
+DEFAULT_MODEL_FILE = MODEL_DIR / "tft_stock_model.pt"
 SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "http://localhost:8000")
 MAX_ENCODER_LENGTH = 30
 MAX_PREDICTION_LENGTH = 5
 
 # Set default dtype for MPS compatibility
 torch.set_default_dtype(torch.float32)
+
+
+# Dataset config matching model_train/train_tft.py (for loading old .pt that only have state_dict)
+TFT_UNKNOWN_REALS = [
+    "open", "high", "low", "close", "volume",
+    "rsi", "sma_50", "sma_200", "macd", "macd_signal", "macd_histogram", "vwap",
+    "pe_ratio", "book_value", "dividend_yield", "roce", "roe", "eps",
+    "debt_to_equity", "face_value", "market_cap",
+    "daily_return", "price_to_sma50", "price_to_sma200", "volatility",
+]
+
+
+def _minimal_dataframe_from_parameters(params: Dict[str, Any]) -> pd.DataFrame:
+    """Build a minimal DataFrame with the columns required by dataset_parameters (for .pt loading)."""
+    max_enc = int(params.get("max_encoder_length", MAX_ENCODER_LENGTH))
+    max_pred = int(params.get("max_prediction_length", MAX_PREDICTION_LENGTH))
+    n_rows = max_enc + max_pred + 5
+    group_ids = params.get("group_ids", ["ticker"])
+    time_idx_name = params.get("time_idx", "time_idx")
+    target_name = params.get("target", "target_return")
+    known_reals = list(params.get("time_varying_known_reals", ["time_idx"]))
+    unknown_reals = list(params.get("time_varying_unknown_reals", TFT_UNKNOWN_REALS))
+    known_cats = list(params.get("time_varying_known_categoricals", ["sma_crossover", "rsi_signal"]))
+
+    data = {time_idx_name: range(n_rows), target_name: [0.0] * n_rows}
+    for g in group_ids:
+        data[g] = ["DUMMY"] * n_rows
+    for col in known_reals:
+        if col not in data:
+            data[col] = list(range(n_rows)) if col == time_idx_name else [0.0] * n_rows
+    for col in unknown_reals:
+        data[col] = [0.0] * n_rows
+    for col in known_cats:
+        data[col] = ["nan"] * n_rows
+    return pd.DataFrame(data)
+
+
+def _create_dataset_and_model_from_pt_state_dict(state_dict: Dict[str, Any]) -> TemporalFusionTransformer:
+    """Build TFT from training config (for old .pt files that only contain state_dict)."""
+    n_rows = MAX_ENCODER_LENGTH + MAX_PREDICTION_LENGTH + 5
+    # Match saved model embedding sizes: sma_crossover [3,3], rsi_signal [4,3] (3 and 4 classes)
+    sma_vals = ["bearish", "bullish"] * (n_rows // 2 + 1)   # 2 + nan -> 3 classes
+    rsi_vals = ["oversold", "neutral", "overbought"] * (n_rows // 3 + 1)  # 3 + nan -> 4 classes
+    data = {
+        "time_idx": list(range(n_rows)),
+        "target_return": [0.0] * n_rows,
+        "ticker": ["DUMMY"] * n_rows,
+        "sma_crossover": sma_vals[:n_rows],
+        "rsi_signal": rsi_vals[:n_rows],
+    }
+    for col in TFT_UNKNOWN_REALS:
+        data[col] = [0.0] * n_rows
+    minimal_df = pd.DataFrame(data)
+    dataset = TimeSeriesDataSet(
+        minimal_df,
+        time_idx="time_idx",
+        target="target_return",
+        group_ids=["ticker"],
+        max_encoder_length=MAX_ENCODER_LENGTH,
+        max_prediction_length=MAX_PREDICTION_LENGTH,
+        static_categoricals=[],
+        time_varying_known_reals=["time_idx"],
+        time_varying_known_categoricals=["sma_crossover", "rsi_signal"],
+        time_varying_unknown_reals=TFT_UNKNOWN_REALS,
+        target_normalizer=TorchNormalizer(method="robust", center=True),
+        categorical_encoders={
+            "sma_crossover": NaNLabelEncoder(add_nan=True),
+            "rsi_signal": NaNLabelEncoder(add_nan=True),
+        },
+        allow_missing_timesteps=True,
+    )
+    model = TemporalFusionTransformer.from_dataset(
+        dataset,
+        learning_rate=0.005,
+        hidden_size=32,
+        attention_head_size=4,
+        dropout=0.1,
+        hidden_continuous_size=16,
+        loss=QuantileLoss(),
+        log_interval=10,
+    )
+    # Load only compatible weights (filter shape mismatches, e.g. categorical embedding sizes)
+    model_state = model.state_dict()
+    filtered = {
+        k: v for k, v in state_dict.items()
+        if k in model_state and v.shape == model_state[k].shape
+    }
+    model.load_state_dict(filtered, strict=False)
+    logger.info(f"Loaded {len(filtered)}/{len(state_dict)} weights from .pt")
+    return model
 
 
 # ============================================================================
@@ -134,33 +227,80 @@ class ModelManager:
         return latest
     
     def load_model(self) -> bool:
-        """Load the trained TFT model."""
+        """Load the trained TFT model from checkpoint or .pt file (with dataset_parameters)."""
         try:
-            # First try saved model weights
-            model_file = MODEL_DIR / "tft_stock_model.pt"
             checkpoint_path = self.find_best_checkpoint()
-            
-            if checkpoint_path and checkpoint_path.exists():
-                logger.info(f"Loading model from checkpoint: {checkpoint_path}")
-                self.model = TemporalFusionTransformer.load_from_checkpoint(
-                    checkpoint_path, 
-                    map_location="cpu"
-                )
-                self.model.eval()
-                self.model_path = str(checkpoint_path)
-                self.is_loaded = True
-                logger.info("Model loaded successfully from checkpoint")
-                return True
-            elif model_file.exists():
-                logger.info(f"Model weights file found at {model_file}")
-                logger.warning("Cannot load .pt file directly - need checkpoint. Looking for checkpoints...")
-                return False
+            if MODEL_PATH_ENV:
+                model_file = Path(MODEL_PATH_ENV)
+                if not model_file.is_absolute():
+                    model_file = (MODEL_DIR / model_file).resolve()
             else:
-                logger.error("No model found. Train the model first using train_tft.py")
+                model_file = DEFAULT_MODEL_FILE
+
+            # 1. Try Lightning checkpoint if present (may fail on some MacOS/MPS setups)
+            if checkpoint_path and checkpoint_path.exists():
+                try:
+                    logger.info(f"Loading model from checkpoint: {checkpoint_path}")
+                    self.model = TemporalFusionTransformer.load_from_checkpoint(
+                        checkpoint_path,
+                        map_location="cpu"
+                    )
+                    self.model.eval()
+                    self.model_path = str(checkpoint_path)
+                    self.is_loaded = True
+                    logger.info("Model loaded successfully from checkpoint")
+                    return True
+                except Exception as ckpt_err:
+                    logger.warning(f"Checkpoint load failed ({ckpt_err}), trying .pt file")
+
+            # 2. Try .pt file (bundle with state_dict + dataset_parameters, or legacy state_dict only)
+            if model_file.exists():
+                loaded = torch.load(str(model_file), map_location="cpu", weights_only=False)
+                if isinstance(loaded, dict) and "state_dict" in loaded and "dataset_parameters" in loaded:
+                    params = loaded["dataset_parameters"]
+                    state_dict = loaded["state_dict"]
+                    minimal_df = _minimal_dataframe_from_parameters(params)
+                    dataset = TimeSeriesDataSet.from_parameters(params, minimal_df)
+                    self.model = TemporalFusionTransformer.from_dataset(
+                        dataset,
+                        learning_rate=0.005,
+                        hidden_size=32,
+                        attention_head_size=4,
+                        dropout=0.1,
+                        hidden_continuous_size=16,
+                        loss=QuantileLoss(),
+                        log_interval=10,
+                    )
+                    self.model.load_state_dict(state_dict, strict=False)
+                    self.model.eval()
+                    self.model_path = str(model_file)
+                    self.is_loaded = True
+                    logger.info(f"Model loaded successfully from .pt: {model_file}")
+                    return True
+                else:
+                    # Legacy .pt: plain state_dict only (no dataset_parameters)
+                    state_dict = loaded if isinstance(loaded, dict) else {}
+                    if state_dict and "dataset_parameters" not in state_dict:
+                        self.model = _create_dataset_and_model_from_pt_state_dict(state_dict)
+                        self.model.eval()
+                        self.model_path = str(model_file)
+                        self.is_loaded = True
+                        logger.info(f"Model loaded from legacy .pt (state_dict only): {model_file}")
+                        return True
+                    logger.warning(
+                        ".pt file format not recognized. "
+                        "Re-save with train_tft.py to include dataset_parameters."
+                    )
+                    return False
+            else:
+                logger.error(
+                    "No model found. Train with train_tft.py (saves to models/tft_stock_model.pt) "
+                    "or set MODEL_PATH to your .pt file."
+                )
                 return False
-                
+
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
+            logger.error(f"Error loading model: {e}", exc_info=True)
             self.is_loaded = False
             return False
     

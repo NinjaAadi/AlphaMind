@@ -1,0 +1,16 @@
+# RAG service: vector store + free LLM (Ollama/Llama)
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-dotenv>=1.0.0
+httpx>=0.25.0
+pydantic>=2.0.0
+
+# Vector store and embeddings (all local, no API keys)
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+
+# Optional: if you want to use Ollama for embeddings instead of sentence-transformers
+# (Ollama can do both embed and generate; sentence-transformers is lighter for embed-only)
+
+# Tests
+pytest>=7.0.0
