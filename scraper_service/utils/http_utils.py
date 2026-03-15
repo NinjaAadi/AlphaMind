@@ -2,6 +2,8 @@
 HTTP utilities for making requests with proper headers and error handling.
 """
 
+import os
+import certifi
 import requests
 from typing import Dict, Any, Optional
 from requests.adapters import HTTPAdapter
@@ -17,26 +19,34 @@ from utils.constants import (
 )
 
 
+def _ssl_verify():
+    """Use certifi CA bundle, or disable verify if SSL_VERIFY=false (e.g. macOS local dev)."""
+    if os.getenv("SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+        return False
+    return certifi.where()
+
+
 def get_session_with_retries() -> requests.Session:
     """
-    Create a requests session with retry strategy.
+    Create a requests session with retry strategy and SSL verify from env/certifi.
     
     Returns:
         requests.Session: Configured session with retry logic
     """
     session = requests.Session()
-    
+    session.verify = _ssl_verify()
+
     retry_strategy = Retry(
         total=RETRY_COUNT,
         backoff_factor=RETRY_BACKOFF_FACTOR,
         status_forcelist=RETRY_STATUS_CODES,
         allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
-    
+
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    
+
     return session
 
 
@@ -94,6 +104,7 @@ def make_request(
             params=params,
             headers=headers,
             timeout=timeout,
+            verify=_ssl_verify(),
             **kwargs
         )
         response.raise_for_status()

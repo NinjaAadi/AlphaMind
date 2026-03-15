@@ -1,6 +1,10 @@
-# Stock Data Aggregator Microservice
+# Scraper Service (AlphaMind)
 
-A production-quality Python microservice for aggregating Indian stock market data from multiple sources.
+**Port: 8000** — Stock data aggregation and **main UI** for AlphaMind.
+
+Part of [AlphaMind](../README.md): this service aggregates Indian stock market data from YFinance, Screener.in, and NewsAPI; serves the dashboard and "Ask the LLM" chat; and proxies LLM requests to the RAG service (8002). The **model service** (8001) and **RAG service** (8002) depend on this API for live stock data.
+
+---
 
 ## Architecture
 
@@ -87,19 +91,21 @@ scraper_service/
 
 ## Running the Service
 
-### Development Mode
+### Development
 
 ```bash
 cd scraper_service
-uvicorn api.server:app --reload
+source venv/bin/activate   # or venv\Scripts\activate on Windows
+uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
-The API will be available at: **http://localhost:8000**
+- **API:** http://localhost:8000  
+- **UI (dashboard + Ask the LLM):** http://localhost:8000  
+- **Docs:** http://localhost:8000/docs  
 
-### Production Mode
+### Production
 
 ```bash
-cd scraper_service
 uvicorn api.server:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
@@ -122,12 +128,13 @@ Response:
 ### 2. Get Single Stock Data
 
 ```
-GET /stock?ticker=RELIANCE.NS&company=Reliance
+GET /stock?company=Reliance
+GET /stock?company=TCS&ticker=TCS.NS
 ```
 
 Parameters:
-- `ticker`: NSE ticker symbol (e.g., RELIANCE.NS, INFY.NS, TCS.NS)
-- `company`: Company name for news search (e.g., Reliance, Infosys)
+- `company`: **Required.** Company name (e.g., Reliance, TCS, Infosys).
+- `ticker`: Optional. NSE ticker (e.g. RELIANCE.NS). If omitted, auto-generated as `{COMPANY}.NS`.
 
 Example Response:
 ```json

@@ -583,6 +583,13 @@
             border-color: var(--accent-blue);
             color: white;
         }
+
+        .llm-answer-wrap .card { padding: 1.25rem; }
+        .llm-answer-text {
+            color: var(--text-primary);
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
     </style>
 </head>
 <body>
@@ -616,6 +623,40 @@
             </form>
             <div class="error-message" id="errorMessage">
                 <p><i class="fas fa-exclamation-circle"></i> <span id="errorText"></span></p>
+            </div>
+        </div>
+
+        <!-- Ask LLM Section -->
+        <div class="search-container" style="margin-top: 1.5rem;">
+            <p class="search-title">Ask the LLM – questions about model predictions and stock data</p>
+            <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.75rem;">For predictions, start the model service (port 8001). Stock data comes from this server.</p>
+            <form class="search-form" id="llmForm">
+                <input
+                    type="text"
+                    class="search-input"
+                    id="llmQuestion"
+                    placeholder="e.g. What did the model predict for Reliance? Compare TCS and Infosys."
+                    autocomplete="off"
+                >
+                <button type="submit" class="search-btn" id="llmBtn">
+                    <i class="fas fa-robot"></i>
+                    <span>Ask</span>
+                </button>
+            </form>
+            <div class="error-message" id="llmError" style="margin-top: 0.5rem;">
+                <p><i class="fas fa-exclamation-circle"></i> <span id="llmErrorText"></span></p>
+            </div>
+            <div id="llmAnswerWrap" class="llm-answer-wrap" style="display: none; margin-top: 1rem;">
+                <div class="card visible" style="margin-top: 0;">
+                    <div class="card-header">
+                        <div class="card-icon purple">
+                            <i class="fas fa-robot"></i>
+                        </div>
+                        <h3 class="card-title">Answer</h3>
+                    </div>
+                    <p id="llmAnswer" class="llm-answer-text"></p>
+                    <p id="llmMeta" class="llm-meta" style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.75rem;"></p>
+                </div>
             </div>
         </div>
     </section>
@@ -1379,6 +1420,61 @@
             const company = companyInput.value.trim();
             if (company) {
                 fetchStockData(company);
+            }
+        });
+
+        // LLM Query
+        const llmForm = document.getElementById('llmForm');
+        const llmQuestion = document.getElementById('llmQuestion');
+        const llmBtn = document.getElementById('llmBtn');
+        const llmError = document.getElementById('llmError');
+        const llmErrorText = document.getElementById('llmErrorText');
+        const llmAnswerWrap = document.getElementById('llmAnswerWrap');
+        const llmAnswer = document.getElementById('llmAnswer');
+        const llmMeta = document.getElementById('llmMeta');
+
+        function setLLMLoading(loading) {
+            llmBtn.disabled = loading;
+            llmBtn.innerHTML = loading
+                ? '<div class="spinner"></div><span>Thinking...</span>'
+                : '<i class="fas fa-robot"></i><span>Ask</span>';
+        }
+
+        function showLLMError(message) {
+            llmErrorText.textContent = message;
+            llmError.classList.add('visible');
+            llmAnswerWrap.style.display = 'none';
+            setTimeout(() => llmError.classList.remove('visible'), 6000);
+        }
+
+        llmForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const question = llmQuestion.value.trim();
+            if (!question) return;
+            setLLMLoading(true);
+            llmError.classList.remove('visible');
+            llmAnswerWrap.style.display = 'none';
+            try {
+                const response = await fetch(`${API_BASE}/api/llm/query`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question }),
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    showLLMError(data.detail || data.error || 'Failed to get answer');
+                    return;
+                }
+                llmAnswer.textContent = data.answer || 'No answer returned.';
+                llmMeta.textContent = data.stocks_fetched != null
+                    ? `Stocks used: ${data.stocks_fetched}`
+                    : '';
+                llmAnswerWrap.style.display = 'block';
+            } catch (err) {
+                console.error('LLM query error:', err);
+                showLLMError(err.message || 'Network error. Is the RAG service running on port 8002?');
+            } finally {
+                setLLMLoading(false);
             }
         });
 

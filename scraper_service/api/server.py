@@ -3,16 +3,27 @@ FastAPI server for stock data aggregation microservice.
 """
 
 import os
+import sys
+
+# Set CA bundle for SSL before any HTTP clients load (fixes macOS "unable to get local issuer certificate")
+import certifi
+_ca_bundle = certifi.where()
+os.environ.setdefault("SSL_CERT_FILE", _ca_bundle)
+os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca_bundle)
+os.environ.setdefault("CURL_CA_BUNDLE", _ca_bundle)
+
+import asyncio
 import logging
 from typing import Optional
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
-import sys
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+import httpx
 
 
 # Add parent directory to path for imports
@@ -44,9 +55,13 @@ async def lifespan(app: FastAPI):
     # Startup
     global aggregator_service
     load_dotenv()
+    # Suppress InsecureRequestWarning when SSL verification is disabled (e.g. local dev)
+    if os.getenv("SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+        import warnings
+        from urllib3.exceptions import InsecureRequestWarning
+        warnings.filterwarnings("ignore", category=InsecureRequestWarning)
     news_api_key = os.getenv("NEWS_API_KEY")
-    
-    if(not news_api_key):
+    if not news_api_key:
         logger.warning("NEWS_API_KEY not found in environment. News data will be unavailable.")
     aggregator_service = AggregatorService(news_api_key=news_api_key)
     logger.info("Aggregator service initialized")
@@ -79,6 +94,13 @@ app.add_middleware(
 # Static files setup
 STATIC_DIR = Path(__file__).parent.parent / "static"
 
+# RAG/LLM service URL for proxy (UI calls this server, which forwards to RAG)
+RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://localhost:8002").rstrip("/")
+
+
+class LLMQueryRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="Natural language question about stocks or predictions")
+
 
 @app.get("/", tags=["UI"])
 async def serve_dashboard():
@@ -95,6 +117,37 @@ async def health_check():
         dict: Health status
     """
     return {"status": MSG_SERVICE_HEALTHY, "service": SERVICE_NAME}
+
+
+@app.post("/api/llm/query", tags=["LLM"])
+async def llm_query(req: LLMQueryRequest = Body(...)):
+    """
+    Proxy to RAG service: ask a question in natural language and get an answer
+    based on model predictions and stock data. Requires RAG service running at RAG_SERVICE_URL.
+    """
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            r = await client.post(
+                f"{RAG_SERVICE_URL}/query",
+                json={"question": question},
+            )
+            r.raise_for_status()
+            return r.json()
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service is not available. Start the RAG service (port 8002) and Ollama.",
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 503:
+            raise HTTPException(status_code=503, detail=e.response.json().get("detail", "LLM service error"))
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        logger.exception("LLM query failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/stock", response_model=StockSummary, tags=["Stock Data"])
@@ -148,8 +201,22 @@ async def get_stock(
         
         logger.info(f"Request for stock data: ticker={ticker}, company={company}")
         
-        # Get aggregated data
-        stock_summary = aggregator_service.get_stock_summary(ticker, company)
+        # Get aggregated data with timeout so we don't hang (yfinance/screener can be slow)
+        try:
+            loop = asyncio.get_event_loop()
+            stock_summary = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda t=ticker, c=company: aggregator_service.get_stock_summary(t, c),
+                ),
+                25.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Stock data request timed out for {ticker}")
+            raise HTTPException(
+                status_code=504,
+                detail="Stock data request timed out. External sources (yfinance/Screener) may be slow. Try again.",
+            )
         
         logger.info(f"Successfully retrieved stock data for {ticker}")
         return stock_summary

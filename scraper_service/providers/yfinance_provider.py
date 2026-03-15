@@ -2,9 +2,21 @@
 YFinance provider for fetching market data from Yahoo Finance.
 """
 
+from pathlib import Path
 from typing import List, Optional
-import yfinance as yf
 import logging
+import certifi
+import yfinance as yf
+from curl_cffi.requests import Session as CurlCffiSession
+
+# Use project-local cache to avoid permission errors (e.g. macOS Library/Caches)
+_cache_dir = Path(__file__).resolve().parent.parent / ".cache" / "py-yfinance"
+_cache_dir.mkdir(parents=True, exist_ok=True)
+try:
+    yf.set_tz_cache_location(str(_cache_dir))
+except Exception:
+    pass  # Non-fatal if cache location cannot be set
+
 from datetime import datetime, timedelta
 from models.stock_models import MarketData, HistoricalPrice, TechnicalIndicators, NewsArticle
 from utils.constants import (
@@ -29,6 +41,11 @@ from utils.technical_indicators import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _yf_session():
+    """Build a curl_cffi Session for yfinance (Yahoo requires it). Uses certifi CA bundle for SSL verification."""
+    return CurlCffiSession(impersonate="chrome", verify=certifi.where())
 
 
 class YFinanceProvider:
@@ -58,9 +75,8 @@ class YFinanceProvider:
         """
         try:
             logger.info(f"Fetching yfinance data for ticker: {ticker}")
-            
-            # Download stock data
-            stock = yf.Ticker(ticker)
+            session = _yf_session()
+            stock = yf.Ticker(ticker, session=session)
             
             # Get current data from info
             info = stock.info
@@ -237,7 +253,8 @@ class YFinanceProvider:
         """
         try:
             logger.info(f"Fetching yfinance news for ticker: {ticker}")
-            stock = yf.Ticker(ticker)
+            session = _yf_session()
+            stock = yf.Ticker(ticker, session=session)
             news = stock.news or []
             
             articles = []
