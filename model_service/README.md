@@ -1,8 +1,20 @@
-# AlphaMind Model Training Service
+# Model Service (AlphaMind)
+
+**Port: 8001** — TFT-based stock prediction API and training pipeline.
+
+Part of [AlphaMind](../README.md): this service runs a trained **Temporal Fusion Transformer (TFT)** for 5-day return predictions. It fetches current features (OHLCV, technicals, fundamentals) from the **scraper service** (8000), runs inference, and returns predictions. The **RAG service** (8002) uses this API to include predictions in natural-language answers.
+
+---
 
 ## Overview
 
-The Model Training Service trains a **Temporal Fusion Transformer (TFT)** model for stock price prediction. The model learns from historical price data, technical indicators, and fundamental ratios to predict future returns.
+The service provides:
+- **Prediction API** — `GET /predict?stock=TCS` or `POST /predict` with body `{"stock": "TCS"}`; returns current price and 5-day predicted returns.
+- **Training** — Scripts in `model_train/` to train the TFT; data pipeline in `run_pipeline.py` (fetches from scraper, outputs CSV).
+
+The model uses **global normalization** and **no ticker embeddings**, so it can predict on any stock (including unseen tickers).
+
+---
 
 ## Architecture
 
@@ -108,13 +120,13 @@ Direction accuracy only checks if the sign (+/-) is correct. R² checks if the a
 ### Training a New Model
 
 ```bash
-cd /Users/aadityapal/Documents/AlphaMind/model_training
+cd model_service
 
-# Clean old artifacts
+# Clean old artifacts (optional)
 rm -f models/tft_stock_model.pt
 rm -rf model_train/lightning_logs
 
-# Train
+# Train (ensure scraper is running if pipeline needs fresh data)
 python model_train/train_tft.py --max-epochs 40
 ```
 
@@ -138,25 +150,18 @@ python model_train/train_tft.py \
 ## File Structure
 
 ```
-model_training/
+model_service/
+├── api/
+│   └── server.py             # Prediction API (FastAPI)
 ├── model_train/
-│   ├── train_tft.py          # Main training script
-│   ├── quick_test.py         # Quick evaluation script
+│   ├── train_tft.py          # Main training script (TFT)
 │   └── lightning_logs/       # Training checkpoints & logs
-│       └── version_X/
-│           ├── checkpoints/
-│           ├── hparams.yaml
-│           └── metrics.csv
-├── output/
-│   ├── training_data.csv     # Preprocessed training data
-│   ├── testing_data.csv      # Preprocessed test data
-│   └── test_predictions.csv  # Model predictions
-├── models/
-│   └── tft_stock_model.pt    # Saved model weights
-├── training_stocks.txt       # List of training tickers
-├── testing_stocks.txt        # List of test tickers
-├── fetch_test_data.py        # Script to fetch test data
-└── requirements.txt          # Python dependencies
+│       └── version_X/checkpoints/
+├── output/                   # Pipeline output (training_data.csv, etc.)
+├── models/                   # Saved .pt weights (optional)
+├── training_stocks.txt       # List of training tickers (if used)
+├── run_pipeline.py           # Data pipeline (scraper → CSV)
+└── requirements.txt
 ```
 
 ---
@@ -240,15 +245,15 @@ The model service exposes a FastAPI server for real-time stock predictions.
 ### Starting the API Server
 
 ```bash
-cd /Users/aadityapal/Documents/AlphaMind/model_service
+cd model_service
 
-# Make sure scraper_service is running on port 8000
-# Then start the model service:
-python -m api.server
-
-# Or with uvicorn directly:
-uvicorn api.server:app --host 0.0.0.0 --port 8001 --reload
+# Ensure scraper_service is running on port 8000 (for live features)
+./venv/bin/python -m uvicorn api.server:app --host 0.0.0.0 --port 8001
+# Or: uvicorn api.server:app --host 0.0.0.0 --port 8001 --reload
 ```
+
+- **API:** http://localhost:8001  
+- **Docs:** http://localhost:8001/docs
 
 ### Environment Variables
 
@@ -341,6 +346,14 @@ Reloads the model from disk (useful after retraining).
 | 502 | Scraper service error |
 | 503 | Model not loaded or scraper unreachable |
 | 500 | Internal prediction error |
+
+### Model loading
+
+On startup the service tries to load a model in this order:
+1. **Lightning checkpoint** in `lightning_logs/*/checkpoints/*.ckpt` (if present).
+2. **.pt file**: `models/tft_stock_model.pt` (or path set by `MODEL_PATH`). Supports both the new format (state_dict + dataset_parameters, from a re-saved training run) and the legacy format (state_dict only).
+
+Set `MODEL_PATH` to use a different path, e.g. `MODEL_PATH=/models/tft_stock_model.pt`.
 
 ### API Documentation
 

@@ -538,13 +538,19 @@ class TFTStockModel:
         return trainer
     
     def save_model(self, path: str) -> None:
-        """Save model weights."""
+        """Save model weights and dataset parameters so the API server can load the .pt file."""
         if self.model is None:
             raise ValueError("Model not built.")
+        if self.training_dataset is None:
+            raise ValueError("Dataset not created. Call create_datasets() first.")
         
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.model.state_dict(), path)
-        print(f"Model saved to {path}")
+        bundle = {
+            "state_dict": self.model.state_dict(),
+            "dataset_parameters": self.training_dataset.get_parameters(),
+        }
+        torch.save(bundle, path)
+        print(f"Model and dataset parameters saved to {path}")
     
     def load_model(self, path: str) -> TemporalFusionTransformer:
         """
@@ -562,8 +568,12 @@ class TFTStockModel:
         if self.model is None:
             self.build_model()
         
-        # Load checkpoint
-        state_dict = torch.load(path, map_location="cpu", weights_only=False)
+        # Load checkpoint (support both bundle format and plain state_dict)
+        loaded = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(loaded, dict) and "state_dict" in loaded:
+            state_dict = loaded["state_dict"]
+        else:
+            state_dict = loaded
         model_state = self.model.state_dict()
         
         # Filter out keys with size mismatch (e.g., ticker embeddings when add_nan=True changes size)
